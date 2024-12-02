@@ -1,24 +1,10 @@
 ---
+# tasks file for playbooks/roles/ocp-lso
 
     # Check the health of Cluster Operators
-    - name: Check all co are in 'Available' state and not in 'Progressing' or 'Degraded' state
-      shell: oc get co --no-headers | awk '{ print $3 $4 $5 }' | grep -w -v TrueFalseFalse | wc -l
-      register: cluster_operator_count
-      until: cluster_operator_count.stdout | int == 0
-      retries: 6
-      delay: 60
-      ignore_errors: true
-
-    # Check the health of nodes in the cluster
-    - name: Check all nodes are healthy
-      shell: oc get nodes --no-headers | grep -v Ready | wc -l
-      register: node_count
-
-    # Fail in case cluster state is unhealthy
-    - name: Fail in case cluster state is unhealthy
-      fail:
-        msg: "The current cluster state is unhealthy."
-      when: cluster_operator_count.stdout | int > 0 or node_count.stdout | int > 0
+    - name: Check if cluster operators and nodes are healthy
+      include_role:
+        name: check-cluster-health
 
     # Checking if worker node contains 500 Gb volume attached
     - name: Check if 500GB volume is attached to worker nodes
@@ -51,7 +37,6 @@
       command: oc patch operatorhub.config.openshift.io/cluster -p='{"spec":{"disableAllDefaultSources":true}}' --type=merge
       register: patch_operatorhub
       failed_when: patch_operatorhub.rc != 0  # Fail if the patch operation fails
-      changed_when: false  # This task does not make changes
 
     # Create ICSP & login to podman
     - name: local storage Operator deployment
@@ -62,56 +47,23 @@
               include_role:
                 name: global-secret-update
 
-        - name: Create ImageContentSourcePolicy
-          k8s:
-            state: present
-            definition:
-              apiVersion: operator.openshift.io/v1alpha1
-              kind: ImageContentSourcePolicy
-              metadata:
-                name: brew-registry
-              spec:
-                repositoryDigestMirrors:
-                  - mirrors:
-                      - brew.registry.redhat.io
-                    source: registry.redhat.io
-                  - mirrors:
-                      - brew.registry.redhat.io
-                    source: registry-proxy.engineering.redhat.com
-
-    # Create CatalogSource YAML for Operator Catalog
-    - name: Create a custom CatalogSource
-      k8s:
-        state: present
-        definition:
-          apiVersion: operators.coreos.com/v1alpha1
-          kind: CatalogSource
-          metadata:
-            name: "{{ lso_catalogsource_name }}"
-            namespace: openshift-marketplace
-          spec:
-            displayName: lso-catalog
-            icon:
-              base64data: ""
-              mediatype: ""
-            image: "{{ lso_catalogsource_image }}"
-            sourceType: grpc
-            grpcPodConfig:
-              securityContextConfig: restricted
-            updateStrategy:
-              registryPoll:
-                interval: 1m0s
-      when: lso_catalogsource_image != '' and lso_catalogsource_image is not none
+        - name: Include role to create ImageContentSourcePolicy and CatalogSource
+          include_role:
+            name: set-custom-catalogsource
+          vars:
+            custom_catalogsource_name: "{{ lso_catalogsource_name }}"
+            custom_catalogsource_display_name: "lso-catalog"
+            custom_catalogsource_image: "{{ lso_catalogsource_image }}"
+    when: lso_catalogsource_image != '' and lso_catalogsource_image != None
 
     # Verify CatalogSource creation
     - name: Verify CatalogSource creation
       command: oc get catsrc -A
       register: catsrc_status
       failed_when: catsrc_status.rc != 0  # Fail if the command fails
-      changed_when: false  # This task does not make changes
 
     # Create LocalStorage Operator YAML content (OperatorGroup and Subscription)
-    - name: Create LocalStorage Operator YAML
+    - name: Create operator group for LocalStorage Operator
       kubernetes.core.k8s:
         state: present
         definition:
@@ -146,14 +98,15 @@
       command: oc get ip -n "{{ lso_namespace }}"
       register: ip_status
       failed_when: ip_status.rc != 0  # Fail if the command fails
-      changed_when: false  # This task does not make changes
-
+      
     # Check the ClusterServiceVersion (CSV) for the LocalStorage Operator
     - name: Check LocalStorage Operator CSV
       command: oc get csv -n "{{ lso_namespace }}"
       register: csv_status
       failed_when: csv_status.rc != 0  # Fail if the command fails
-      changed_when: false  # This task does not make changes
+      when:
+        - lso_namespace is defined  # Ensure lso_namespace is defined
+        - csv_status.stdout | search('local-storage-operator')  # Ensure the CSV includes the correct operator
 
     # Create LocalVolumeSet YAML content for local block volumes
     - name: Create LocalVolumeSet YAML for local block volumes
@@ -196,19 +149,16 @@
       delay: 10
       until: lvs_status.rc == 0
       failed_when: lvs_status.rc != 0  # Fail if LocalVolumeSet is not created within 5 retries
-      changed_when: false  # This task does not make changes
 
     - name: Verify creation of diskmanager pods
       command: oc get pods -n "{{ lso_namespace }}" --selector app=diskmaker-manager
       register: check_pods
       failed_when: check_pods.rc != 0
-      changed_when: false
 
     - name: Verify the creation of StorageClass
       command: oc get sc localblock
       register: check_sc
       failed_when: check_sc.rc != 0
-      changed_when: false
 
     - name: Wait for persistent volumes to be created
       pause:
@@ -218,13 +168,28 @@
       command: oc get pv --selector storage.openshift.com/owner-kind=LocalVolumeSet
       register: check_pv
       failed_when: check_pv.rc != 0
-      changed_when: false
+
+    - name: Delete existing PersistentVolumeClaim and Pod (if they exist)
+      kubernetes.core.k8s:
+        state: absent
+        definition:
+          - kind: PersistentVolumeClaim
+            apiVersion: v1
+            metadata:
+              name: test-local-claim
+          - apiVersion: v1
+            kind: Pod
+            metadata:
+              name: busybox-lso
+              namespace: default
+      register: delete_pvc
+      failed_when: false  # Do not fail if delete command is not successful (e.g., resource doesn't exist)
+      changed_when: delete_pvc is changed  # Mark as changed only if a deletion actually occurred
 
     # Testing localblock storage class
     - name: Create PersistentVolumeClaim YAML
-      copy:
-        dest: "/tmp/PersistentVolumeClaim.yaml"
-        content: |
+      kubernetes.core.k8s:
+        definition:
           kind: PersistentVolumeClaim
           apiVersion: v1
           metadata:
@@ -237,7 +202,6 @@
               requests:
                 storage: 100Gi
             storageClassName: localblock
-
           ---
           apiVersion: v1
           kind: Pod
@@ -257,26 +221,12 @@
                   - devicePath: "/dev/lso"
                     name: local-data
 
-    - name: Delete existing PersistentVolumeClaim and Pod (if they exist)
-      command: oc delete -f /tmp/PersistentVolumeClaim.yaml
-      register: delete_pvc
-      failed_when: false  # Do not fail if delete command is not successful (e.g., resource doesn't exist)
-      changed_when: true
-
-    - name: Apply PersistentVolumeClaim and Pod YAML
-      command: oc create -f /tmp/PersistentVolumeClaim.yaml
-      register: pvc_creation
-      failed_when: pvc_creation.rc != 0
-      changed_when: true
-
     - name: Verify PVC status
       command: oc get pvc
       register: pvc_status
       failed_when: pvc_status.rc != 0
-      changed_when: false
 
     - name: Verify Pod status
       command: oc get pods
       register: pod_status
       failed_when: pod_status.rc != 0
-      changed_when: false
