@@ -138,4 +138,5 @@
 - import_playbook: ocp-kube-burner.yml
   when: enable_kube_burner is defined and enable_kube_burner
 
-  
+- import_playbook: ocp-ingress-firewall-operator.yml
+  when: ingress_enabled is defined and ingress_enabled
