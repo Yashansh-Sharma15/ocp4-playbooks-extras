@@ -1,0 +1,70 @@
+---
+# Fetch Kafka logs with up to 3 attempts.
+# Variables expected: external_server_logs_path, kafka_path, kafka_host,
+#                     kafka_port, app_log_label, audit_log_label, infra_log_label
+- name: Fetch Kafka logs (attempt {{ _attempt }})
+  block:
+    - name: Save the logs on Kafka server
+      ansible.builtin.shell: |
+        mkdir -p {{ external_server_logs_path }}/kafka
+        {{ kafka_path }}/kafka-console-consumer.sh --bootstrap-server {{ kafka_host }}:{{ kafka_port }} --topic {{ app_log_label }} --max-messages 10 --timeout-ms 20000 > {{ external_server_logs_path }}/kafka/application.txt
+        {{ kafka_path }}/kafka-console-consumer.sh --bootstrap-server {{ kafka_host }}:{{ kafka_port }} --topic {{ audit_log_label }} --max-messages 10 --timeout-ms 20000 > {{ external_server_logs_path }}/kafka/audit.txt
+        {{ kafka_path }}/kafka-console-consumer.sh --bootstrap-server {{ kafka_host }}:{{ kafka_port }} --topic {{ infra_log_label }} --max-messages 10 --timeout-ms 20000 > {{ external_server_logs_path }}/kafka/infrastructure.txt
+      async: 120
+      poll: 10
+      vars:
+        ansible_user: root
+        ansible_ssh_private_key_file: "/tmp/logging_key"
+      delegate_to: kafka
+
+    - name: Copy the logs file from Kafka to controller
+      ansible.builtin.fetch:
+        src: "{{ external_server_logs_path }}/kafka/{{ log_file }}.txt"
+        dest: "/tmp/clf_kafka_logs/"
+        flat: true
+      loop:
+        - audit
+        - infrastructure
+        - application
+      loop_control:
+        loop_var: log_file
+      vars:
+        ansible_user: root
+        ansible_ssh_private_key_file: "/tmp/logging_key"
+      delegate_to: kafka
+
+    - name: Copy Kafka logs from controller to bastion
+      ansible.builtin.copy:
+        src: "/tmp/clf_kafka_logs/{{ log_file }}.txt"
+        dest: "{{ external_server_logs_path }}/kafka/{{ log_file }}.txt"
+        mode: "0644"
+      loop:
+        - audit
+        - infrastructure
+        - application
+      loop_control:
+        loop_var: log_file
+
+    - name: Validate Kafka logs have content
+      ansible.builtin.shell: |
+        [ -s "{{ external_server_logs_path }}/kafka/application.txt" ] && \
+        [ -s "{{ external_server_logs_path }}/kafka/audit.txt" ] && \
+        [ -s "{{ external_server_logs_path }}/kafka/infrastructure.txt" ]
+      changed_when: false
+      register: kafka_valid
+  rescue:
+    - name: Kafka retry pause (attempt {{ _attempt }})
+      ansible.builtin.pause:
+        seconds: 60
+      when: _attempt | int < 3
+
+    - name: Retry Kafka fetch
+      ansible.builtin.include_tasks: fetch-kafka-logs.yml
+      vars:
+        _attempt: "{{ _attempt | int + 1 }}"
+      when: _attempt | int < 3
+
+    - name: Warn — Kafka log retrieval failed after 3 attempts
+      ansible.builtin.debug:
+        msg: "WARNING: Kafka log retrieval failed after 3 attempts. Continuing."
+      when: _attempt | int >= 3

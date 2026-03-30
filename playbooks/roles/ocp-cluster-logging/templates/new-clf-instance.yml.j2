@@ -28,11 +28,11 @@
                 token:
                   from: serviceAccount
               target:
-                name: "{{ (check_lokistack.stdout|length > 0) | ternary(check_lokistack.stdout, lokistack_name.stdout) }}"
+                name: "{{ effective_lokistack_name }}"
                 namespace: openshift-logging
             tls:
               ca:
-                configMapName: "{{ (check_lokistack.stdout|length > 0) | ternary(check_lokistack.stdout, lokistack_name.stdout) }}-gateway-ca-bundle"
+                configMapName: "{{ effective_lokistack_name }}-gateway-ca-bundle"
                 key: service-ca.crt
             type: lokiStack
 {% if elasticsearch_server_url is defined %}
@@ -88,6 +88,18 @@
             name: loki-user
             type: loki
 {% endif %}
+{% if syslog_server_url is defined %}
+          - syslog:
+              appName: ocp47.22
+              facility: user
+              msgID: mymsg
+              procID: myproc
+              rfc: RFC5424
+              severity: informational
+              url: "{{ syslog_server_url }}"
+            name: syslog-user
+            type: syslog
+{% endif %}
 {% if cw_secret is defined %}
           - name: cloudwatch-user
             type: cloudwatch
@@ -121,6 +133,9 @@
 {% if loki_server_url is defined %}
           - loki-user
 {% endif %}
+{% if syslog_server_url is defined %}
+          - syslog-user
+{% endif %}
 {% if cw_secret is defined %}
           - cloudwatch-user
 {% endif %}
@@ -141,6 +156,9 @@
 {% if loki_server_url is defined %}
           - loki-user
 {% endif %}
+{% if syslog_server_url is defined %}
+          - syslog-user
+{% endif %}
 {% if cw_secret is defined %}
           - cloudwatch-user
 {% endif %}
@@ -160,6 +178,9 @@
 {% endif %}
 {% if loki_server_url is defined %}
           - loki-user
+{% endif %}
+{% if syslog_server_url is defined %}
+          - syslog-user
 {% endif %}
 {% if cw_secret is defined %}
           - cloudwatch-user

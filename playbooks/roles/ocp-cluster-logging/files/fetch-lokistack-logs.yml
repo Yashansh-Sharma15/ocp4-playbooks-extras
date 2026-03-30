@@ -1,0 +1,33 @@
+---
+# Fetch LokiStack logs with up to 3 attempts.
+# Variables expected: file_path, external_server_logs_path, lokistack_name
+- name: Fetch LokiStack logs (attempt {{ _attempt }})
+  block:
+    - name: Save the logs for lokistack instance
+      ansible.builtin.shell: |
+        echo "{{ lokistack_name }}"
+        {{ file_path }}/lokistack.sh {{ lokistack_name }}
+
+    - name: Validate LokiStack logs have content
+      ansible.builtin.shell: |
+        [ -s "{{ external_server_logs_path }}/lokistack/application.txt" ] && \
+        [ -s "{{ external_server_logs_path }}/lokistack/audit.txt" ] && \
+        [ -s "{{ external_server_logs_path }}/lokistack/infrastructure.txt" ]
+      changed_when: false
+      register: lokistack_valid
+  rescue:
+    - name: LokiStack retry pause (attempt {{ _attempt }})
+      ansible.builtin.pause:
+        seconds: 60
+      when: _attempt | int < 3
+
+    - name: Retry LokiStack fetch
+      ansible.builtin.include_tasks: fetch-lokistack-logs.yml
+      vars:
+        _attempt: "{{ _attempt | int + 1 }}"
+      when: _attempt | int < 3
+
+    - name: Warn — LokiStack log retrieval failed after 3 attempts
+      ansible.builtin.debug:
+        msg: "WARNING: LokiStack log retrieval failed after 3 attempts. Continuing."
+      when: _attempt | int >= 3

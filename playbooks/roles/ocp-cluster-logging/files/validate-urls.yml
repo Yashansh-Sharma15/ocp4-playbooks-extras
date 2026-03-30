@@ -1,21 +1,121 @@
 ---
 # Set elasticsearch_server_url
 - block:
-  - name: Check Elasticsearch URL is reachable or not
-    uri:
-      url: "{{ elasticsearch_url }}"
-    register: op
+    - name: Check Elasticsearch URL is reachable
+      ansible.builtin.uri:
+        url: "{{ elasticsearch_url }}"
+        method: GET
+        validate_certs: false
+        timeout: 10
+      register: es_op
+      failed_when: false
 
-  - set_fact:
-      elasticsearch_server_url: "{{ elasticsearch_url }}"
-    when: op.failed == false
-  ignore_errors: yes
-  when: elasticsearch_url != "" and elasticsearch_url != None
-  
+    - name: Set Elasticsearch server URL
+      ansible.builtin.set_fact:
+        elasticsearch_server_url: "{{ elasticsearch_url }}"
+      when:
+        - not es_op.failed
+
+    - name: Fail if Elasticsearch URL is unreachable
+      ansible.builtin.fail:
+        msg: "Elasticsearch URL is invalid or unreachable: {{ elasticsearch_url }}"
+      when:
+        - es_op.failed
+
+  when: (elasticsearch_url | default('') | trim | length) > 0
+    
 # Set loki_server_url
-- set_fact:
-    loki_server_url: "{{ loki_url }}"
-  when: loki_url != "" and loki_url != None
+- block:
+    - name: Check Loki URL is reachable or not
+      ansible.builtin.uri:
+        url: "{{ loki_url }}/ready"
+        method: GET
+        validate_certs: false
+        timeout: 10
+      register: loki_op
+      failed_when: false
+
+    - name: Set Loki server URL
+      ansible.builtin.set_fact:
+        loki_server_url: "{{ loki_url }}"
+      when:
+        - not loki_op.failed
+        
+    - name: Fail if Loki URL is unreachable
+      ansible.builtin.fail:
+        msg: "Loki URL is invalid or unreachable: {{ loki_url }}"
+      when:
+        - loki_op.failed
+
+  when: (loki_url | default('') | trim | length) > 0
+
+# Set kafka_server_url
+- block:
+    - name: Set Kafka host and port
+      ansible.builtin.set_fact:
+        kafka_server_url: "{{ kafka_url }}"
+        kafka_host: "{{ kafka_url | regex_replace('^tcp://', '') | split(':') | first }}"
+        kafka_port: "{{ kafka_url | split(':') | last | int }}"
+
+    - name: Check Kafka TCP port is reachable
+      ansible.builtin.wait_for:
+        host: "{{ kafka_host }}"
+        port: "{{ kafka_port }}"
+        timeout: 10
+      register: kafka_op
+      failed_when: false
+
+    - name: Fail if Kafka URL is unreachable
+      fail:
+        msg: "Kafka URL is invalid or unreachable"
+      when: kafka_op.failed
+  when: (kafka_url | default('') | trim | length) > 0
+
+# Set syslog_server_url
+- block:
+    - name: Set Syslog host and port
+      ansible.builtin.set_fact:
+        syslog_server_url: "{{ syslog_url }}"
+        syslog_host: "{{ syslog_url | regex_replace('^tcp://', '') | split(':') | first }}"
+        syslog_port: "{{ syslog_url | split(':') | last | int }}"
+
+    - name: Check Syslog TCP port is reachable
+      ansible.builtin.wait_for:
+        host: "{{ syslog_host }}"
+        port: "{{ syslog_port }}"
+        timeout: 10
+      register: syslog_op
+      failed_when: false
+
+    - name: Fail if Syslog URL is unreachable
+      fail:
+        msg: "Syslog URL is invalid or unreachable"
+      when: syslog_op.failed
+  when: (syslog_url | default('') | trim | length) > 0
+    
+
+# Set fluentd_server_url
+- block:
+    - name: Check Fluentd TCP port is reachable
+      wait_for:
+        host: "{{ fluentd_url | regex_replace('^tcp://', '') | split(':') | first }}"
+        port: "{{ fluentd_url | split(':') | last | int }}"
+        timeout: 10
+      register: fluentd_op
+      failed_when: false
+
+    - name: Set Fluentd server URL
+      set_fact:
+        fluentd_server_url: "{{ fluentd_url }}"
+      when:
+        - not fluentd_op.failed
+        
+    - name: Fail if Fluentd URL is unreachable
+      fail:
+        msg: "Fluentd URL is invalid or unreachable"
+      when: fluentd_op.failed
+      
+  when: (fluentd_url | default('') | trim | length) > 0
 
 # Check if the secret for AWS is exists and set_fact
 - block:
@@ -24,97 +124,19 @@
     register: aws_secret
 
   # Set cw_secret
-  - set_fact:
+  - name: Set cloudwatch secret
+    set_fact:
       cw_secret: "{{ cloudwatch_secret }}"
-    when: aws_secret.failed == false
+    when: not aws_secret.failed
     
   # Set aws_region
-  - set_fact:
+  - name: Set aws_region
+    set_fact:
       aws_cw_region: "{{ aws_region | default('ap-south-1', true)}}"
-  ignore_errors: yes
-  when: cloudwatch_secret != "" and cloudwatch_secret != None
-
-# Extracts host names and ports from external systems URLs
-- name: Get host and ports from URLs
-  shell: | 
-    echo "{{item}}" | sed -e 's/[^/]*\/\/\([^@]*@\)\?\([^:/]*\).*/\2/'
-    grep -oE '[0-9]{4,5}' <<< "{{item}}"
-  register: host_and_port
-  ignore_errors: yes
-  loop:
-    - "{{ syslog_url | default('1.1.1.1:6514', true)}}}}"
-    - "{{ fluentd_url | default('1.1.1.1:24224', true)}} }}"
-    - "{{ kafka_url | default('1.1.1.1:9092', true)}}}}"
-
-# Create list of host names
-- set_fact:
-    host_names: "{{ host_names | default([]) + [item[0] | default('1.1.1.1', true)] }}"
-  loop: "{{ host_and_port.results | map(attribute='stdout_lines')| list }}"
-
-# Create list of ports
-- set_fact:
-    ports: "{{ ports | default([]) + [item[1] | default('1111', true)] }}"
-  loop: "{{ host_and_port.results | map(attribute='stdout_lines')| list }}"
-
-# Validate if external system is rechable
-- wait_for: host={{item.0}} port={{item.1}} timeout=5
-  ignore_errors: yes
-  register: output
-  with_together:
-  - "{{ host_names }}"
-  - "{{ ports }}"
-
-# Set facts for Syslog, Fluentd and Kafka URLs if URL is valid
-- set_fact:
-    syslog_server_url: "{{syslog_url}}"
-    syslog_host: "{{host_names.0}}"
-  when: output.results[0].failed == false
-
-- set_fact:
-    fluentd_server_url: "{{fluentd_url}}"
-    fluent_host: "{{host_names.1}}"
-  when: output.results[1].failed == false
-
-- set_fact:
-    kafka_server_url: "{{kafka_url}}"
-    kafka_host: "{{host_names.2}}"
-  when: output.results[2].failed == false
-
-- block:
-  - name: Fail if Elasticsearch URL is unreachable
-    fail:
-      msg: "Elasticsearch URL is invalid or unreachable"
-    when: elasticsearch_url != "" and elasticsearch_url != None and elasticsearch_server_url is undefined
-
-  - name: Fail if Syslog URL is unreachable
-    fail:
-      msg: "Syslog URL is invalid or unreachable"
-    when: syslog_url != "" and syslog_url != None and syslog_server_url is undefined
-
-  - name: Fail if Fluentd URL is unreachable
-    fail:
-      msg: "Fluentd URL is invalid or unreachable"
-    when: fluentd_url != "" and fluentd_url != None and fluentd_server_url is undefined
-
-  - name: Fail if Kafka URL is unreachable
-    fail:
-      msg: "Kafka URL is invalid or unreachable"
-    when: kafka_url != "" and kafka_url != None and kafka_server_url is undefined
-
-  - name: Fail if Loki URL is unreachable
-    fail:
-      msg: "Loki URL is invalid or unreachable"
-    when: loki_url != "" and loki_url != None and loki_server_url is undefined
+    when: not aws_secret.failed
 
   - name: Fail if AWS CloudWatch secret is not present
     fail:
       msg: "AWS CloudWatch secret is not present"
-    when: cloudwatch_secret != "" and cloudwatch_secret != None and cw_secret is undefined
-
-# Set default value for Syslog host URL if other urls are empty and cluster_log_forwarder variable is set to true
-- set_fact:
-    syslog_server_url: "tls://rsyslogserver.east.example.com:514"
-  when:
-    - elasticsearch_server_url is undefined and syslog_server_url is undefined
-    - fluentd_server_url is undefined and kafka_server_url is undefined
-    - loki_server_url is undefined and cw_secret is undefined
+    when: aws_secret.failed
+  when: (cloudwatch_secret | default('') | trim | length) > 0

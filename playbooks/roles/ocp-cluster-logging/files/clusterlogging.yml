@@ -1,36 +1,46 @@
 ---
-# Set the default collector type
-- set_fact:
-    collector_type: "{{ log_collector_type | default('fluentd', true) }}"
+# Set the default collector type and derived version facts
+- name: Set collector type and version facts
+  ansible.builtin.set_fact:
+    collector_type: "{{ log_collector_type | default('vector', true) }}"
     clo_version: "{{ cluster_logging_channel | regex_search('\\d+\\.\\d+') | float }}"
     log_labels: "{{ log_label | default('test-clf', true) }}"
 
-# Check Lokistack instance
-- name: Check if the Lokistack instance exists
-  shell: |
-    oc get lokistack -n openshift-logging | grep lokistack | awk 'NR==1{print $1}' | xargs
+# Check if a LokiStack instance already exists so its name can be reused
+- name: Check if a LokiStack instance already exists
+  ansible.builtin.shell: >
+    oc get lokistack -n openshift-logging --no-headers 2>/dev/null | awk 'NR==1{print $1}'
   register: check_lokistack
+  changed_when: false
 
-# Create a random string to append to lokistack name
-- name: Create Lokistack name
+# Generate a unique LokiStack name only when no existing instance is found
+- name: Generate a unique LokiStack name
   block:
-    - name: Generate random string
-      shell: "tr -dc 'a-z' < /dev/urandom | head -c 5"
+    - name: Generate random 5-character suffix
+      ansible.builtin.shell: "tr -dc 'a-z' < /dev/urandom | head -c 5"
       register: random_string
+      changed_when: false
 
-    #Create lokistack name
-    - name: Generate Lokistack name
-      shell: echo "lokistack-{{ random_string.stdout }}"
-      register: lokistack_name
+    - name: Set lokistack_name fact
+      ansible.builtin.set_fact:
+        lokistack_name: "lokistack-{{ random_string.stdout }}"
+  when: check_lokistack.stdout | length == 0
 
-# Check if the ClusterLogging CR is exists
-- name: Check if the ClusterLogging instance exists
-  shell: oc get ClusterLogging -n openshift-logging | wc -l
+# Resolve the final LokiStack name once; all subsequent tasks reference this single fact
+- name: Resolve effective LokiStack name
+  ansible.builtin.set_fact:
+    effective_lokistack_name: >-
+      {{ (check_lokistack.stdout | length > 0) | ternary(check_lokistack.stdout, lokistack_name) }}
+
+# Check whether a ClusterLogging CR already exists (needed for restart-guard logic later)
+- name: Check if the ClusterLogging instance already exists
+  ansible.builtin.shell: oc get ClusterLogging -n openshift-logging --no-headers 2>/dev/null | wc -l
   register: check_cl
+  changed_when: false
 
-# Create a OpenShift logging instance
-- name: Create an instance for logging operator
-  k8s:
+# ── CLO ≤ 5.8 : Elasticsearch-backed ClusterLogging ─────────────────────────
+- name: Deploy ClusterLogging with Elasticsearch store (CLO ≤ 5.8)
+  kubernetes.core.k8s:
     state: present
     definition:
       apiVersion: "logging.openshift.io/v1"
@@ -82,146 +92,91 @@
   register: cl_cr
   when: clo_version | float <= 5.8
 
-- name: Create an instance for logging operator
-  k8s:
-    state: present
-    definition:
-      apiVersion: "logging.openshift.io/v1"
-      kind: "ClusterLogging"
-      metadata:
-        name: "instance"
-        namespace: "openshift-logging"
-        annotations:
-          logging.openshift.io/preview-vector-collector: "{{ (collector_type == 'vector') | ternary('enabled', omit) }}"
-      spec:
-        managementState: "Managed"
-        logStore:
-          type: "lokistack"
-          lokistack:
-            name: "{{ (check_lokistack.stdout|length > 0) | ternary(check_lokistack.stdout, lokistack_name.stdout) }}"
-        collection:
-          logs: "{{ collector_spec | from_yaml }}"
-  vars:
-    collector_spec: |
-      type: {{ collector_type }}
-      {{ collector_type }}: {}
-  register: cl_cr
-  when: clo_version | float == 5.9
+- name: Verify LokiStack credential secret exists
+  ansible.builtin.shell: >
+    oc get secret lokicred-secret -n openshift-logging --no-headers 2>/dev/null | wc -l
+  register: lokisecret
+  changed_when: false
+  failed_when: lokisecret.stdout | int == 0
 
-# Create a ConfigMap for lokistack
-- name: Create ConfigMap for lokistack
-  k8s:
-    state: present
-    definition:
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: lokistack-ca
-        namespace: openshift-logging
-        annotations:
-          service.beta.openshift.io/inject-cabundle: "true"
-  when: clo_version | float >= 5.9
+# ── CLO 5.9 : LokiStack-backed ClusterLogging (legacy logging API) ────────────
+- name: Block for CLO 5.9 resources
+  block:
+    - name: Deploy ClusterLogging with LokiStack store (CLO 5.9)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: "logging.openshift.io/v1"
+          kind: "ClusterLogging"
+          metadata:
+            name: "instance"
+            namespace: "openshift-logging"
+            annotations:
+              logging.openshift.io/preview-vector-collector: "{{ (collector_type == 'vector') | ternary('enabled', omit) }}"
+          spec:
+            managementState: "Managed"
+            logStore:
+              type: "lokistack"
+              lokistack:
+                name: "{{ effective_lokistack_name }}"
+            collection:
+              logs: "{{ collector_spec | from_yaml }}"
+      vars:
+        collector_spec: |
+          type: {{ collector_type }}
+          {{ collector_type }}: {}
+      register: cl_cr
 
-# Create Service Account
-- name: Create Service Account
-  shell: |
-    oc create sa logcollector -n openshift-logging
-    oc adm policy add-cluster-role-to-user collect-application-logs -z logcollector -n openshift-logging
-    oc adm policy add-cluster-role-to-user collect-infrastructure-logs -z logcollector -n openshift-logging
-    oc adm policy add-cluster-role-to-user collect-audit-logs -z logcollector -n openshift-logging
+    - name: Deploy LokiStack instance (CLO 5.9)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: loki.grafana.com/v1
+          kind: LokiStack
+          metadata:
+            name: "{{ effective_lokistack_name }}"
+            namespace: openshift-logging
+          spec:
+            size: 1x.small
+            replicationFactor: 1
+            storage:
+              secret:
+                name: "lokicred-secret"
+                type: s3
+            storageClassName: "nfs-storage-provisioner"
+            tenants:
+              mode: openshift-logging
+            rules:
+              enabled: true
+              selector:
+                matchLabels:
+                  openshift.io/cluster-monitoring: 'true'
+              namespaceSelector:
+                matchLabels:
+                  openshift.io/cluster-monitoring: 'true'
+  when: clo_version | float == 5.9 and lokisecret.stdout | int == 1
 
-# Create a Role binding for lokistack
-- name: Create Cluster Role for lokistack
-  k8s:
-    state: present
-    definition:
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRole
-      metadata:
-        name: lokistack-instance-tenant-logs
-      rules:
-      - apiGroups:
-        - 'loki.grafana.com'
-        resources:
-        - application
-        - infrastructure
-        - audit
-        resourceNames:
-        - logs
-        verbs:
-        - 'get'
-        - 'create'
-  when: clo_version | float >= 5.9
-
-- name: Create Role binding for lokistack
-  k8s:
-    state: present
-    definition:
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRoleBinding
-      metadata:
-        name: lokistack-instance-tenant-logs
-      roleRef:
-        apiGroup: rbac.authorization.k8s.io
-        kind: ClusterRole
-        name: lokistack-instance-tenant-logs
-      subjects:
-      - kind: ServiceAccount
-        name: logcollector
-        namespace: openshift-logging
-  when: clo_version | float >= 5.9
-
-# Create lokistack
-- name: Create lokistack
-  k8s:
+# ── CLO ≥ 6.0 : LokiStack-backed (new observability API) ─────────────────────
+- name: Deploy LokiStack instance (CLO ≥ 6.0)
+  kubernetes.core.k8s:
     state: present
     definition:
       apiVersion: loki.grafana.com/v1
       kind: LokiStack
       metadata:
-        name: "{{ (check_lokistack.stdout|length > 0) | ternary(check_lokistack.stdout, lokistack_name.stdout) }}"
-        namespace: openshift-logging
-      spec:
-        size: 1x.small
-        replicationFactor: 1
-        storage:
-          secret:
-            name: lokicred-secret
-            type: s3
-        storageClassName: nfs-storage-provisioner
-        tenants:
-          mode: openshift-logging
-        rules:
-          enabled: true
-          selector:
-            matchLabels:
-              openshift.io/cluster-monitoring: 'true'
-          namespaceSelector:
-            matchLabels:
-              openshift.io/cluster-monitoring: 'true'
-  when: clo_version | float == 5.9
-
-# Create lokistack for 6.0 and above
-- name: Create lokistack
-  k8s:
-    state: present
-    definition:
-      apiVersion: loki.grafana.com/v1
-      kind: LokiStack
-      metadata:
-        name: "{{ (check_lokistack.stdout|length > 0) | ternary(check_lokistack.stdout, lokistack_name.stdout) }}"
+        name: "{{ effective_lokistack_name }}"
         namespace: openshift-logging
       spec:
         size: 1x.demo
         replicationFactor: 1
         storage:
           schemas:
-          - effectiveDate: "2023-10-15"
-            version: v13
+            - effectiveDate: "2023-10-15"
+              version: v13
           secret:
-            name: lokicred-secret
+            name: "lokicred-secret"
             type: s3
-        storageClassName: nfs-storage-provisioner
+        storageClassName: "nfs-storage-provisioner"
         tenants:
           mode: openshift-logging
         rules:
@@ -232,58 +187,154 @@
           namespaceSelector:
             matchLabels:
               openshift.io/cluster-monitoring: 'true'
-  when: clo_version | float >= 6.0
+  when: clo_version | float >= 6.0 and lokisecret.stdout | int == 1
 
-- name: Check lokistack secret exists
-  shell: oc get secret -n openshift-logging | grep "lokicred-secret" | wc -l
-  register: lokisecret
-  failed_when: lokisecret.stdout|int == 0
-  when: clo_version | float >= 5.9
+# ── CLO ≥ 5.9 : Shared LokiStack resources (ConfigMap, SA, RBAC, secret check)
+- name: Deploy shared LokiStack resources (CLO ≥ 5.9)
+  block:
+    - name: Create CA bundle ConfigMap for LokiStack TLS injection
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: lokistack-ca
+            namespace: openshift-logging
+            annotations:
+              service.beta.openshift.io/inject-cabundle: "true"
 
-# Check if deployment is successfull
-- name: Check the deployment
-  shell: oc get deployment -n openshift-logging | awk '{print $1}' | wc -l
+    - name: Create logcollector ServiceAccount
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: logcollector
+            namespace: openshift-logging
+
+    - name: Bind log-collection ClusterRoles to logcollector ServiceAccount
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: "logcollector-{{ item }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: "{{ item }}"
+          subjects:
+            - kind: ServiceAccount
+              name: logcollector
+              namespace: openshift-logging
+      loop:
+        - collect-application-logs
+        - collect-infrastructure-logs
+        - collect-audit-logs
+
+    - name: Create LokiStack tenant ClusterRole
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: lokistack-instance-tenant-logs
+          rules:
+            - apiGroups:
+                - 'loki.grafana.com'
+              resources:
+                - application
+                - infrastructure
+                - audit
+              resourceNames:
+                - logs
+              verbs:
+                - 'get'
+                - 'create'
+
+    - name: Bind LokiStack tenant ClusterRole to logcollector ServiceAccount
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: lokistack-instance-tenant-logs
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: lokistack-instance-tenant-logs
+          subjects:
+            - kind: ServiceAccount
+              name: logcollector
+              namespace: openshift-logging
+  when: clo_version | float >= 5.9 and lokisecret.stdout | int == 1
+
+# ── Wait for operator deployments to become available ─────────────────────────
+- name: Wait for logging operator deployments to be available
+  ansible.builtin.shell: >
+    oc get deployment -n openshift-logging --no-headers 2>/dev/null | wc -l
   register: deployments
-  until: deployments.stdout|int > 4
+  changed_when: false
+  until: deployments.stdout | int > 4
   retries: 10
   delay: 120
 
-- name: Check logging pods are restarting if CR for ClusterLogging has changed
+# ── Handle pod restarts when ClusterLogging CR changed ────────────────────────
+- name: Handle pod restarts after ClusterLogging CR change
   block:
-    # Check pods are in restarting state
-    - name: Check the logging Pods are restarting
-      shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 == "Terminating" ) print $1}' | wc -l
+    - name: Wait for collector pods to enter Terminating state
+      ansible.builtin.shell: >
+        oc get pods -n openshift-logging --no-headers 2>/dev/null | awk '$3 == "Terminating" {print $1}' | wc -l
       register: pods
-      until: pods.stdout|int > 0
+      changed_when: false
+      until: pods.stdout | int > 0
       retries: 10
       delay: 5
-      ignore_errors: yes
+      ignore_errors: true
 
-    - name: Delete pods if not restarted automatic
-      shell: oc delete pod $(oc get pods -n openshift-logging| grep 'fluent\|collector' | awk '{print $1}') -n openshift-logging
+    - name: Force-delete collector pods if they did not restart automatically
+      ansible.builtin.shell: >
+        oc delete pod -n openshift-logging $(oc get pods -n openshift-logging --no-headers | awk '$1 ~ /fluent|collector/ {print $1}')
       when: pods.failed
+      changed_when: true
 
-    # Check pods are in good state
-    - name: Check the logging pods are in good state
-      shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 != "Running" && $3 != "Completed" ) print $1}' | wc -l
+    - name: Wait for all logging pods to reach Running or Completed state
+      ansible.builtin.shell: >
+        oc get pods -n openshift-logging --no-headers 2>/dev/null | awk '$3 != "Running" && $3 != "Completed" {print $1}' | wc -l
       register: pods
-      until: pods.stdout|int == 0
+      changed_when: false
+      until: pods.stdout | int == 0
       retries: 10
       delay: 90
-      ignore_errors: yes
-  when: cl_cr.changed and check_cl.stdout|int != 0
+      ignore_errors: true
+  when: cl_cr.changed and check_cl.stdout | int != 0
 
-- name: Get error state pods
-  shell: oc get pod -n openshift-logging | grep Error| wc -l
-  register: err_pods
+# ── Remediate pods stuck in Error state ───────────────────────────────────────
+- name: Remediate pods stuck in Error state
+  block:
+    - name: Count pods in Error state
+      ansible.builtin.shell: >
+        oc get pods -n openshift-logging --no-headers 2>/dev/null | awk '$3 == "Error" {print $1}' | wc -l
+      register: err_pods
+      changed_when: false
 
-- name: Delete all pods in error state
-  shell: oc delete pod $(oc get pods -n openshift-logging| grep Error | awk '{print $1}') -n openshift-logging
-  when: err_pods.stdout|int != 0
+    - name: Delete pods in Error state
+      ansible.builtin.shell: >
+        oc delete pod -n openshift-logging $(oc get pods -n openshift-logging --no-headers | awk '$3 == "Error" {print $1}')
+      when: err_pods.stdout | int != 0
+      changed_when: true
 
-- name: Check the logging pods are in good state
-  shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 != "Running" && $3 != "Completed" ) print $1}' | wc -l
+# ── Final readiness gate ───────────────────────────────────────────────────────
+- name: Final check – all logging pods must be Running or Completed
+  ansible.builtin.shell: >
+    oc get pods -n openshift-logging --no-headers 2>/dev/null | awk '$3 != "Running" && $3 != "Completed" {print $1}' | wc -l
   register: pods
-  until: pods.stdout|int == 0
+  changed_when: false
+  until: pods.stdout | int == 0
   retries: 20
   delay: 120

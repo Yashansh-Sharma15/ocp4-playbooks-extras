@@ -1,0 +1,465 @@
+---
+# ── 1. Resolve OCP server version ─────────────────────────────────────────────
+- name: Get the OCP server version
+  ansible.builtin.shell: >
+    oc version | awk '/Server Version/{print $3}' | cut -d. -f1,2
+  register: ocp_version
+  changed_when: false
+  failed_when: ocp_version.stdout | length == 0
+
+# ── 2. Validate required channel variables ────────────────────────────────────
+- name: Fail when required channel variables are missing
+  ansible.builtin.fail:
+    msg: >
+      Missing channel configuration: 'cluster_logging_channel' and at least one of
+      'elastic_search_channel' (CLO ≤ 5.8) or 'loki_channel' (CLO ≥ 5.9) must be set.
+  when: >
+    (cluster_logging_channel | default('') == '') or
+    (elastic_search_channel | default('') == '' and loki_channel | default('') == '')
+
+# ── 3. Derive shared facts used throughout this playbook ──────────────────────
+- name: Set derived facts for logging version and paths
+  ansible.builtin.set_fact:
+    log_labels: "{{ log_label | default('test-clf', true) }}"
+    clo_version: "{{ cluster_logging_channel | regex_search('\\d+\\.\\d+') | float }}"
+    logging_version: "{{ cluster_logging_channel.split('-')[1].replace('.', '-') }}"
+    cl_log_dir: "{{ log_dir_path | default('/tmp/logging/files/clf_logs', true) }}"
+    ocp_server_version: "{{ ocp_version.stdout | float }}"
+    file_path: "{{ manifest_dir_path | default('/tmp/logging/files', true) }}"
+
+
+# ── 4. Validate external service URLs and bootstrap Python on remote VMs ──────
+- name: Validate external service URLs and install Python on remote hosts
+  when: cluster_log_forwarder | bool
+  block:
+    - name: Validate external service URLs
+      ansible.builtin.include_tasks: "{{ role_path }}/files/validate-urls.yml"
+
+    # - name: Install Python 3 on external Fluentd VM
+    #   ansible.builtin.raw: sudo yum install -y python3
+    #   delegate_to: fluentd
+    #   when: fluentd_server_url is defined
+
+    # - name: Install Python 3 on external Syslog VM
+    #   ansible.builtin.raw: sudo yum install -y python3
+    #   delegate_to: syslog
+    #   when: syslog_server_url is defined
+
+    # - name: Install Python 3 on external Kafka VM
+    #   ansible.builtin.raw: sudo yum install -y python3
+    #   delegate_to: kafka
+    #   when: kafka_server_url is defined
+
+# ── 5a. Custom CatalogSource path — CLO < 5.9 (Elasticsearch-backed) ──────────
+- name: Configure custom CatalogSource for CLO less than 5.9 (Elasticsearch)
+  when:
+    - elasticsearch_clf_cs | default('') != ''
+    - clusterlogging_clf_cs | default('') != ''
+    - clo_version | float < 5.9
+  block:
+    - name: Render CatalogSource manifest from template
+      ansible.builtin.template:
+        src: "{{ role_path }}/templates/CatalogSource.yaml.j2"
+        dest: "{{ file_path }}/CatalogSource.yml"
+        mode: "0644"
+
+    # OCP < 4.13 uses ImageContentSourcePolicy; ≥ 4.13 uses ImageDigestMirrorSet
+    - name: Copy ImageContentSourcePolicy manifest (OCP < 4.13)
+      ansible.builtin.copy:
+        src: "{{ role_path }}/files/ImageContentSourcePolicy.yml"
+        dest: "{{ file_path }}/ImageContentSourcePolicy.yml"
+        mode: "0644"
+      when: ocp_server_version | float < 4.13
+
+    - name: Apply ImageContentSourcePolicy (OCP < 4.13)
+      ansible.builtin.shell: oc apply -f "{{ file_path }}/ImageContentSourcePolicy.yml"
+      changed_when: true
+      when: ocp_server_version | float < 4.13
+
+    - name: Copy ImageDigestMirrorSet manifest (OCP ≥ 4.13)
+      ansible.builtin.copy:
+        src: "{{ role_path }}/files/ImageDigestMirrorSet.yml"
+        dest: "{{ file_path }}/ImageDigestMirrorSet.yml"
+        mode: "0644"
+      when: ocp_server_version | float >= 4.13
+
+    - name: Apply ImageDigestMirrorSet (OCP ≥ 4.13)
+      ansible.builtin.shell: oc apply -f "{{ file_path }}/ImageDigestMirrorSet.yml"
+      changed_when: true
+      when: ocp_server_version | float >= 4.13
+
+    - name: Apply CatalogSource
+      ansible.builtin.shell: oc apply -f "{{ file_path }}/CatalogSource.yml"
+      changed_when: true
+
+    - name: Wait for CatalogSource entries to appear
+      ansible.builtin.shell: >
+        oc get CatalogSource -n openshift-marketplace --no-headers 2>/dev/null
+        | awk '/cluster-logging|elasticsearch/' | wc -l
+      register: cs_count
+      changed_when: false
+      until: cs_count.stdout | int == 2
+      retries: 10
+      delay: 30
+
+    - name: Fail if expected CatalogSources are not present
+      ansible.builtin.fail:
+        msg: >
+          Expected 2 CatalogSource entries (cluster-logging, elasticsearch) but found
+          {{ cs_count.stdout }}. Check the CatalogSource manifests and marketplace pods.
+      when: cs_count.stdout | int != 2
+
+    - name: Set operator source facts for Elasticsearch subscriptions
+      ansible.builtin.set_fact:
+        elasticsearch_op_source: "elasticsearch"
+        cluster_logging_op_source: "cluster-logging"
+
+# ── 5b. Custom CatalogSource path — CLO ≥ 5.9 (Loki-backed) ──────────────────
+- name: Configure custom CatalogSource for CLO greater than or equal to 5.9 (Loki)
+  when:
+    - loki_clf_cs | default('') != ''
+    - clusterlogging_clf_cs | default('') != ''
+    - clo_version | float >= 5.9
+  block:
+    - name: Render new CatalogSource manifest from template
+      ansible.builtin.template:
+        src: "{{ role_path }}/templates/NewCatalogSource.yaml.j2"
+        dest: "{{ file_path }}/NewCatalogSource.yml"
+        mode: "0644"
+
+    - name: Copy ImageContentSourcePolicy manifest (OCP < 4.13)
+      ansible.builtin.copy:
+        src: "{{ role_path }}/files/ImageContentSourcePolicy.yml"
+        dest: "{{ file_path }}/ImageContentSourcePolicy.yml"
+        mode: "0644"
+      when: ocp_server_version | float < 4.13
+
+    - name: Apply ImageContentSourcePolicy (OCP < 4.13)
+      ansible.builtin.shell: oc apply -f "{{ file_path }}/ImageContentSourcePolicy.yml"
+      changed_when: true
+      when: ocp_server_version | float < 4.13
+
+    - name: Copy ImageDigestMirrorSet manifest (OCP ≥ 4.13)
+      ansible.builtin.copy:
+        src: "{{ role_path }}/files/ImageDigestMirrorSet.yml"
+        dest: "{{ file_path }}/ImageDigestMirrorSet.yml"
+        mode: "0644"
+      when: ocp_server_version | float >= 4.13
+
+    - name: Apply ImageDigestMirrorSet (OCP ≥ 4.13)
+      ansible.builtin.shell: oc apply -f "{{ file_path }}/ImageDigestMirrorSet.yml"
+      changed_when: true
+      when: ocp_server_version | float >= 4.13
+
+    - name: Apply new CatalogSource
+      ansible.builtin.shell: oc apply -f "{{ file_path }}/NewCatalogSource.yml"
+      changed_when: true
+
+    - name: Wait for CatalogSource entries to appear
+      ansible.builtin.shell: >
+        oc get CatalogSource -n openshift-marketplace --no-headers 2>/dev/null
+        | awk '/cluster-logging|loki/' | wc -l
+      register: cs_count
+      changed_when: false
+      until: cs_count.stdout | int == 2
+      retries: 10
+      delay: 30
+
+    - name: Fail if expected CatalogSources are not present
+      ansible.builtin.fail:
+        msg: >
+          Expected 2 CatalogSource entries (cluster-logging, loki) but found
+          {{ cs_count.stdout }}. Check the CatalogSource manifests and marketplace pods.
+      when: cs_count.stdout | int != 2
+
+    - name: Set operator source facts for Loki subscriptions
+      ansible.builtin.set_fact:
+        loki_op_source: "loki"
+        cluster_logging_op_source: "cluster-logging"
+
+# ── 5c. Default CatalogSource path — use built-in redhat-operators ─────────────
+- name: Use default redhat-operators CatalogSource
+  when: >
+    (clusterlogging_clf_cs | default('') == '') or
+    (elasticsearch_clf_cs | default('') == '' and loki_clf_cs | default('') == '')
+  block:
+    # Detect existing custom mirror resources before deciding to clean them up
+    - name: Check whether custom ImageContentSourcePolicy exists
+      ansible.builtin.shell: >
+        oc get ImageContentSourcePolicy --no-headers 2>/dev/null | awk '/brew-registry/' | wc -l
+      register: icsp
+      changed_when: false
+
+    - name: Check whether custom ImageDigestMirrorSet exists
+      ansible.builtin.shell: >
+        oc get ImageDigestMirrorSet --no-headers 2>/dev/null | awk '/fbc-clo-testing-idms/' | wc -l
+      register: idms
+      changed_when: false
+
+    - name: Check whether custom CatalogSources exist (CLO ≤ 5.8)
+      ansible.builtin.shell: >
+        oc get CatalogSource -n openshift-marketplace --no-headers 2>/dev/null | awk '/cluster-logging|elasticsearch/' | wc -l
+      register: cs_count_old
+      changed_when: false
+      when: clo_version | float <= 5.8
+
+    - name: Check whether custom CatalogSources exist (CLO ≥ 5.9)
+      ansible.builtin.shell: >
+        oc get CatalogSource -n openshift-marketplace --no-headers 2>/dev/null | awk '/cluster-logging|loki/' | wc -l
+      register: cs_count_new
+      changed_when: false
+      when: clo_version | float >= 5.9
+
+    - name: Remove custom ImageContentSourcePolicy if present
+      ansible.builtin.shell: oc delete ImageContentSourcePolicy brew-registry
+      changed_when: true
+      when: icsp.stdout | int == 1
+
+    - name: Remove custom ImageDigestMirrorSet if present
+      ansible.builtin.shell: oc delete ImageDigestMirrorSet fbc-clo-testing-idms
+      changed_when: true
+      when: idms.stdout | int == 1
+
+    - name: Remove custom CatalogSources for Elasticsearch stack (CLO ≤ 5.8)
+      ansible.builtin.shell: >
+        oc delete CatalogSource elasticsearch cluster-logging -n openshift-marketplace
+      changed_when: true
+      when:
+        - clo_version | float <= 5.8
+        - cs_count_old.stdout | int == 2
+
+    - name: Remove custom CatalogSources for Loki stack (CLO ≥ 5.9)
+      ansible.builtin.shell: >
+        oc delete CatalogSource loki cluster-logging -n openshift-marketplace
+      changed_when: true
+      when:
+        - clo_version | float >= 5.9
+        - cs_count_new.stdout | int == 2
+
+    - name: Re-enable all default OperatorHub sources
+      ansible.builtin.shell: >
+        oc patch operatorhub.config.openshift.io/cluster -p='{"spec":{"disableAllDefaultSources":false}}' --type=merge
+      changed_when: true
+
+    - name: Set operator source facts for Elasticsearch subscriptions (default)
+      ansible.builtin.set_fact:
+        elasticsearch_op_source: "redhat-operators"
+        cluster_logging_op_source: "redhat-operators"
+      when: clo_version | float <= 5.8
+
+    - name: Set operator source facts for Loki subscriptions (default)
+      ansible.builtin.set_fact:
+        loki_op_source: "redhat-operators"
+        cluster_logging_op_source: "redhat-operators"
+      when: clo_version | float >= 5.9
+
+# ── 6. Verify a default StorageClass exists ───────────────────────────────────
+- name: Verify a default StorageClass exists
+  ansible.builtin.shell: >
+    oc get sc --no-headers 2>/dev/null | awk '/(default)/{print $1}' | wc -l
+  register: storage_class
+  changed_when: false
+  failed_when: storage_class.stdout | int == 0
+
+# ── 7. Create required namespaces ─────────────────────────────────────────────
+- name: Create namespaces for Elasticsearch/Loki and Cluster Logging operators
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ item }}"
+        annotations:
+          openshift.io/node-selector: ""
+        labels:
+          openshift.io/cluster-monitoring: "true"
+  loop:
+    - openshift-operators-redhat
+    - openshift-logging
+
+# ── 8. Create OperatorGroups ───────────────────────────────────────────────────
+- name: Create OperatorGroup for Elasticsearch/Loki operator namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: openshift-operators-redhat
+        namespace: openshift-operators-redhat
+      spec: {}
+
+- name: Create OperatorGroup for Cluster Logging operator namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: cluster-logging
+        namespace: openshift-logging
+      spec:
+        targetNamespaces: []
+
+# ── 9a. Subscribe operators — CLO ≤ 5.8 (Elasticsearch backend) ───────────────
+- name: Create Subscriptions for CLO ≤ 5.8 (cluster-logging + elasticsearch-operator)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+      spec:
+        channel: "{{ item.channel }}"
+        name: "{{ item.name }}"
+        installPlanApproval: Automatic
+        source: "{{ item.cs_src }}"
+        sourceNamespace: openshift-marketplace
+  loop:
+    - name: cluster-logging
+      namespace: openshift-logging
+      channel: "{{ cluster_logging_channel }}"
+      cs_src: "{{ cluster_logging_op_source }}"
+    - name: elasticsearch-operator
+      namespace: openshift-operators-redhat
+      channel: "{{ elastic_search_channel }}"
+      cs_src: "{{ elasticsearch_op_source }}"
+  when: clo_version | float <= 5.8
+
+# ── 9b. Subscribe operators — CLO ≥ 5.9 (Loki backend) ───────────────────────
+- name: Create Subscriptions for CLO ≥ 5.9 (cluster-logging + loki-operator)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace }}"
+      spec:
+        channel: "{{ item.channel }}"
+        name: "{{ item.name }}"
+        installPlanApproval: Automatic
+        source: "{{ item.cs_src }}"
+        sourceNamespace: openshift-marketplace
+  loop:
+    - name: cluster-logging
+      namespace: openshift-logging
+      channel: "{{ cluster_logging_channel }}"
+      cs_src: "{{ cluster_logging_op_source }}"
+    - name: loki-operator
+      namespace: openshift-operators-redhat
+      channel: "{{ loki_channel }}"
+      cs_src: "{{ loki_op_source }}"
+  when: clo_version | float >= 5.9
+
+# ── 10. Wait for operator CSVs to reach Succeeded phase ──────────────────────
+- name: Wait for operator CSVs to reach Succeeded phase
+  ansible.builtin.shell: >
+    oc get csv -n openshift-logging --no-headers 2>/dev/null | awk '($1 ~ /^cluster-logging/ || $1 ~ /^elasticsearch-operator/ || $1 ~ /^loki-operator/) && $NF == "Succeeded" {print $1}' | wc -l
+  register: operators
+  changed_when: false
+  until: operators.stdout | int == 2
+  retries: 5
+  delay: 120
+
+- name: Fail when one or more operators did not install successfully
+  ansible.builtin.fail:
+    msg: >
+      Expected 2 operators in Succeeded state but found {{ operators.stdout }}.
+      Run 'oc get csv -n openshift-logging' for details.
+  when: operators.failed
+
+# ── 11. Deploy ClusterLogging instance ────────────────────────────────────────
+- name: Create ClusterLogging instance
+  ansible.builtin.include_tasks: "{{ role_path }}/files/clusterlogging.yml"
+
+# ── 12. Deploy test workloads ─────────────────────────────────────────────────
+- name: Create nginx test pod in default namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      kind: Pod
+      apiVersion: v1
+      metadata:
+        name: nginx-pod-default
+        namespace: default
+        labels:
+          role: web
+      spec:
+        containers:
+          - name: nginx-pod-default
+            image: "{{ nginx_image }}"
+            ports:
+              - containerPort: 80
+
+- name: Wait for nginx-pod-default to become Ready
+  ansible.builtin.shell: >
+    kubectl wait --namespace=default --for=condition=Ready pod/nginx-pod-default --timeout=180s
+  changed_when: false
+
+- name: Create namespace for centos-logtest structured-data app
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: test-logging
+        annotations:
+          openshift.io/node-selector: ""
+        labels:
+          openshift.io/cluster-monitoring: "true"
+
+- name: copy centos-logtest file
+  ansible.builtin.copy:
+    src: "{{ role_path }}/files/logtest-structured-data.yml"
+    dest: "{{ file_path }}/logtest-structured-data.yml"
+    mode: "0644"
+
+- name: Deploy centos-logtest structured-data generator
+  ansible.builtin.shell: >
+    oc apply -f "{{ file_path }}/logtest-structured-data.yml" -n test-logging
+  changed_when: true
+
+- name: Wait for centos-logtest pods to become Ready
+  ansible.builtin.shell: >
+    kubectl wait --all --namespace=test-logging --for=condition=Ready pods --timeout=180s
+  changed_when: false
+
+# ── 13. Clone and deploy acmeair-mainservice-java ─────────────────────────────
+- name: Clone acmeair-mainservice-java repository
+  ansible.builtin.git:
+    repo: https://github.com/ocp-power-demos/acmeair-mainservice-java.git
+    dest: "{{ file_path }}/acmeair-mainservice-java/"
+    update: false
+
+- name: Patch MongoDB image references in acmeair manifests
+  ansible.builtin.shell: >
+    find {{ file_path }}/acmeair-mainservice-java -type f \( -name "*.yaml" -o -name "*.yml" \) -exec sed -i 's|image:.*ibmcom/icp-mongodb[^[:space:]]*|image: docker.io/ibmcom/icp-mongodb-ppc64le:4.0.12|g' {} \;
+  changed_when: true
+
+- name: Deploy acmeair-mainservice-java and wait for pods
+  ansible.builtin.shell: |
+    oc project default
+    sh {{ file_path }}/acmeair-mainservice-java/scripts/deployToOpenshift.sh
+    kubectl wait --all --namespace=acme-air --for=condition=Ready pods --timeout=300s
+    oc label ns acme-air "openshift.io/cluster-monitoring=true"
+  changed_when: true
+  ignore_errors: true
+
+- name: Pause to allow new application logs to accumulate
+  ansible.builtin.pause:
+    minutes: 1
+
+# ── 14. Create ClusterLogForwarder instance ───────────────────────────────────
+- name: Create ClusterLogForwarder instance
+  ansible.builtin.include_tasks: "{{ role_path }}/files/clusterlogforwarder.yml"
+  vars:
+    app_log_label: "{{ log_labels }}-application"
+    infra_log_label: "{{ log_labels }}-infrastructure"
+    audit_log_label: "{{ log_labels }}-audit"
+  when: cluster_log_forwarder | bool
