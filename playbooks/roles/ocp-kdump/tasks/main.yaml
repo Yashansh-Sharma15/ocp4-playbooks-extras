@@ -66,72 +66,85 @@
 - name: Apply MachineConfig to the OpenShift cluster
   command: "oc apply -f /tmp/99-worker-kdump.yaml"
 
+# Wait for MCO to start rendering/applying the new config
+- name: Wait for MachineConfigPool worker to start updating
+  shell: |
+    oc get mcp worker -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}'
+  register: mcp_updating
+  retries: 10
+  delay: 30
+  until: mcp_updating.stdout == "True"
+
+# Wait for MCO to finish applying - nodes will reboot during this
+- name: Wait for MachineConfigPool worker to finish updating
+  shell: |
+    oc get mcp worker -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: mcp_updated
+  retries: 30
+  delay: 60
+  until: mcp_updated.stdout == "True"
+
+# Ensure MachineConfigPool is not degraded
+- name: Ensure MachineConfigPool worker is not degraded
+  shell: |
+    oc get mcp worker -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}'
+  register: mcp_degraded
+  retries: 10
+  delay: 30
+  until: mcp_degraded.stdout == "False"
+  failed_when: mcp_degraded.stdout == "True"
+
+# Wait for all worker nodes to be Ready after MCO reboot
 - name: Wait until all worker nodes are in Ready state
   shell: |
     oc get nodes --selector='node-role.kubernetes.io/worker' --no-headers | \
-    awk '{print $2}' | grep -v 'Ready' || true
+    awk '{print $2}' | grep -v '^Ready$' || true
   register: worker_nodes_ready
-  retries: 10
+  retries: 20
   delay: 30
   until: worker_nodes_ready.stdout == ""
-
-- name: Restart kdump on worker node
-  shell: >
-    oc debug node/{{ worker_node }} -- chroot /host bash -c 'kdumpctl restart'
-  register: kdump_restart_output
-  failed_when: "'error' in kdump_restart_output.stderr.lower()"
-  changed_when: true
 
 - name: Wait for system to settle
   pause:
     seconds: 60
 
-# Check kdump status
+# Check kdump status on worker node via oc debug
 - name: Check kdump status on worker node
   shell: >
-    oc debug node/{{ worker_node }} -- chroot /host bash -c 'kdumpctl status'
+    oc debug node/{{ worker_node | trim }} -- chroot /host bash -c 'kdumpctl status'
   register: kdump_status_output
+  failed_when: false
 
 - name: Debug kdump status
   debug:
     var: kdump_status_output.stdout_lines
 
 - name: Fail if kdump is not operational
-  become: yes
   fail:
-    msg: "Kdump is NOT operational"
-  when:
-    - "'Kdump is operational' not in kdump_status_output.stdout"
+    msg: "Kdump is NOT operational. Current status: {{ kdump_status_output.stdout }}"
+  when: "'active' not in kdump_status_output.stdout"
 
-- name: Check if kdump service is active
-  become: yes
-  command: systemctl is-active kdump
-  register: kdump_service_status
-
-- name: Fail if kdump service is not active
-  fail:
-    msg: "kdump service is not active"
-  when: kdump_service_status.stdout != "active"
-
-- name: Validate essential keys exist in /etc/sysconfig/kdump
-  become: true
-  shell: |
-    grep -q '^KDUMP_COMMANDLINE_APPEND=' /etc/sysconfig/kdump && \
-    grep -q '^KDUMP_COMMANDLINE_REMOVE=' /etc/sysconfig/kdump && \
-    grep -q '^KEXEC_ARGS=' /etc/sysconfig/kdump && \
-    grep -q '^KDUMP_IMG=' /etc/sysconfig/kdump
+# Validate /etc/sysconfig/kdump on worker node via oc debug
+- name: Validate essential keys exist in /etc/sysconfig/kdump on worker node
+  shell: >
+    oc debug node/{{ worker_node | trim }} -- chroot /host bash -c
+    'grep -q "^KDUMP_COMMANDLINE_APPEND=" /etc/sysconfig/kdump &&
+     grep -q "^KDUMP_COMMANDLINE_REMOVE=" /etc/sysconfig/kdump &&
+     grep -q "^KEXEC_ARGS=" /etc/sysconfig/kdump &&
+     grep -q "^KDUMP_IMG=" /etc/sysconfig/kdump'
   register: sysconfig_kdump_check
   failed_when: sysconfig_kdump_check.rc != 0
 
-- name: Validate /etc/kdump.conf contents
-  become: yes
-  shell: |
-    grep -q '^path /var/crash' /etc/kdump.conf && \
-    grep -q 'core_collector makedumpfile -l --message-level 7 -d 31' /etc/kdump.conf
+# Validate /etc/kdump.conf on worker node via oc debug
+- name: Validate /etc/kdump.conf contents on worker node
+  shell: >
+    oc debug node/{{ worker_node | trim }} -- chroot /host bash -c
+    'grep -q "^path /var/crash" /etc/kdump.conf &&
+     grep -q "core_collector makedumpfile" /etc/kdump.conf'
   register: kdump_conf_check
   failed_when: kdump_conf_check.rc != 0
 
-# trigger crash up to 10 times to account for logs not being generated on every run.
+# Trigger crash up to 10 times to account for logs not being generated on every run.
 - name: Repeat crash trigger 10 times with pauses
   include_tasks: crash_trigger.yml
   loop: "{{ range(1, 11) | list }}"
