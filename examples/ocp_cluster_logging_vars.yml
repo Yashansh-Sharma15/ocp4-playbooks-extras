@@ -1,6 +1,7 @@
 ## ocp-cluster-log-forwarding required vars
 ocp_cluster_logging: false
 cluster_log_forwarder: false
+log_enable_global_secret: false
 cluster_logging_channel: ""
 elastic_search_channel: ""
 loki_channel: ""
@@ -8,6 +9,7 @@ elasticsearch_clf_cs: ""  # brew.registry.redhat.io/rh-osbs/iib:111110
 clusterlogging_clf_cs: "" # brew.registry.redhat.io/rh-osbs/iib:11111
 loki_clf_cs: ""  # brew.registry.redhat.io/rh-osbs/iib:111112
 log_label: ""
+manifest_dir_path: "/tmp/logging/files"
 elasticsearch_url: ""
 syslog_url: ""
 fluentd_url: ""
@@ -16,7 +18,8 @@ kafka_path: "" # Location of kafka on external vm ex. /usr/local/kafka/bin
 loki_url: ""
 cloudwatch_secret: ""
 aws_region: ""
-log_dir_path: "/root/clf_logs"
+log_dir_path: "/tmp/logging/files/clf_logs"
 kibana_ldap_validation: false
 log_collector_type: ""
+enable_logging_uiplugin: false
 clf_clean_up: false

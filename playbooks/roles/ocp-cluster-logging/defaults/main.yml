@@ -1,3 +1,7 @@
 ---
 # defaults file for playbooks/roles/ocp-cluster-logging
 nginx_image: quay.io/powercloud/nginx-unprivileged:latest
+log_dir_path: "/tmp/logging/files/clf_logs"
+manifest_dir_path: "/tmp/logging/files"
+log_label: "test-clf"
+log_collector_type: vector

@@ -1,0 +1,43 @@
+---
+# Fetch Elasticsearch logs with up to 3 attempts.
+# Variables expected: elasticsearch_server_url, cl_log_dir, infra_log_label,
+#                     audit_log_label, app_log_label, clo_version
+- name: Fetch Elasticsearch logs (attempt {{ _attempt }})
+  block:
+    - name: Fetch Logs from Elasticsearch (CLO >= 6.0)
+      ansible.builtin.shell: |
+        curl -XGET "{{ elasticsearch_server_url }}/infra*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.label":"{{ infra_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/infrastructure.txt
+        curl -XGET "{{ elasticsearch_server_url }}/audit*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.label":"{{ audit_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/audit.txt
+        curl -XGET "{{ elasticsearch_server_url }}/app*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.label":"{{ app_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/application.txt
+      when: clo_version | float >= 6.0
+
+    - name: Fetch Logs from Elasticsearch (CLO <= 5.9)
+      ansible.builtin.shell: |
+        curl -XGET "{{ elasticsearch_server_url }}/infra*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.logs":"{{ infra_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/infrastructure.txt
+        curl -XGET "{{ elasticsearch_server_url }}/audit*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.logs":"{{ audit_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/audit.txt
+        curl -XGET "{{ elasticsearch_server_url }}/app*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.logs":"{{ app_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/application.txt
+      when: clo_version | float <= 5.9
+
+    - name: Validate Elasticsearch logs have content
+      ansible.builtin.shell: |
+        [ -s "{{ cl_log_dir }}/elasticsearch/application.txt" ] && \
+        [ -s "{{ cl_log_dir }}/elasticsearch/audit.txt" ] && \
+        [ -s "{{ cl_log_dir }}/elasticsearch/infrastructure.txt" ]
+      changed_when: false
+      register: es_valid
+  rescue:
+    - name: Elasticsearch retry pause (attempt {{ _attempt }})
+      ansible.builtin.pause:
+        seconds: 60
+      when: _attempt | int < 3
+
+    - name: Retry Elasticsearch fetch
+      ansible.builtin.include_tasks: fetch-elasticsearch-logs.yml
+      vars:
+        _attempt: "{{ _attempt | int + 1 }}"
+      when: _attempt | int < 3
+
+    - name: Warn — Elasticsearch log retrieval failed after 3 attempts
+      ansible.builtin.debug:
+        msg: "WARNING: Elasticsearch log retrieval failed after 3 attempts. Continuing."
+      when: _attempt | int >= 3

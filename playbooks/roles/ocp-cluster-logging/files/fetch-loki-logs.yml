@@ -1,0 +1,36 @@
+---
+# Fetch Loki logs with up to 3 attempts.
+# Variables expected: loki_server_url, cl_log_dir
+- name: Fetch Loki logs (attempt {{ _attempt }})
+  block:
+    - name: Fetch logs from Loki
+      ansible.builtin.shell: |
+        curl -G -s "{{ loki_server_url }}/api/prom/query" --data-urlencode 'query={log_type="infrastructure"}' > {{ cl_log_dir }}/loki/infrastructure.txt
+        curl -G -s "{{ loki_server_url }}/api/prom/query" --data-urlencode 'query={log_type="audit"}' > {{ cl_log_dir }}/loki/audit.txt
+        curl -G -s "{{ loki_server_url }}/api/prom/query" --data-urlencode 'query={log_type="application"}' > {{ cl_log_dir }}/loki/application.txt
+      async: 120
+      poll: 10
+
+    - name: Validate Loki logs have content
+      ansible.builtin.shell: |
+        [ -s "{{ cl_log_dir }}/loki/application.txt" ] && \
+        [ -s "{{ cl_log_dir }}/loki/audit.txt" ] && \
+        [ -s "{{ cl_log_dir }}/loki/infrastructure.txt" ]
+      changed_when: false
+      register: loki_valid
+  rescue:
+    - name: Loki retry pause (attempt {{ _attempt }})
+      ansible.builtin.pause:
+        seconds: 60
+      when: _attempt | int < 3
+
+    - name: Retry Loki fetch
+      ansible.builtin.include_tasks: fetch-loki-logs.yml
+      vars:
+        _attempt: "{{ _attempt | int + 1 }}"
+      when: _attempt | int < 3
+
+    - name: Warn — Loki log retrieval failed after 3 attempts
+      ansible.builtin.debug:
+        msg: "WARNING: Loki log retrieval failed after 3 attempts. Continuing."
+      when: _attempt | int >= 3

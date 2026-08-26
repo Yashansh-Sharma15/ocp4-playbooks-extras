@@ -1,0 +1,72 @@
+---
+# Fetch Syslog logs with up to 3 attempts.
+# Variables expected: external_server_logs_path, syslog_server_logfile, log_labels
+- name: Fetch Syslog logs (attempt {{ _attempt }})
+  block:
+    - name: Save the logs on external Syslog instance
+      ansible.builtin.shell: |
+        mkdir -p {{ external_server_logs_path }}/syslog
+        awk "NR >= 100" {{ syslog_server_logfile }} | grep {{ log_labels }}-audit | shuf -n 10 > {{ external_server_logs_path }}/syslog/audit.txt
+        awk "NR >= 100" {{ syslog_server_logfile }} | grep {{ log_labels }}-infrastructure | shuf -n 10 > {{ external_server_logs_path }}/syslog/infrastructure.txt
+        awk "NR >= 100" {{ syslog_server_logfile }} | grep {{ log_labels }}-application | shuf -n 10 > {{ external_server_logs_path }}/syslog/application.txt
+      async: 60
+      poll: 5
+      args:
+        executable: /bin/bash
+      vars:
+        ansible_user: root
+        ansible_ssh_private_key_file: "/tmp/logging_key"
+      no_log: true
+      delegate_to: syslog
+
+    - name: Copy the logs file from Syslog to controller
+      ansible.builtin.fetch:
+        src: "{{ external_server_logs_path }}/syslog/{{ log_file }}.txt"
+        dest: "/tmp/clf_syslog_logs/"
+        flat: true
+      loop:
+        - audit
+        - infrastructure
+        - application
+      loop_control:
+        loop_var: log_file
+      vars:
+        ansible_user: root
+        ansible_ssh_private_key_file: "/tmp/logging_key"
+      delegate_to: syslog
+
+    - name: Copy Syslog logs from controller to bastion
+      ansible.builtin.copy:
+        src: "/tmp/clf_syslog_logs/{{ log_file }}.txt"
+        dest: "{{ external_server_logs_path }}/syslog/{{ log_file }}.txt"
+        mode: "0644"
+      loop:
+        - audit
+        - infrastructure
+        - application
+      loop_control:
+        loop_var: log_file
+
+    - name: Validate Syslog logs have content
+      ansible.builtin.shell: |
+        [ -s "{{ external_server_logs_path }}/syslog/application.txt" ] && \
+        [ -s "{{ external_server_logs_path }}/syslog/audit.txt" ] && \
+        [ -s "{{ external_server_logs_path }}/syslog/infrastructure.txt" ]
+      changed_when: false
+      register: syslog_valid
+  rescue:
+    - name: Syslog retry pause (attempt {{ _attempt }})
+      ansible.builtin.pause:
+        seconds: 60
+      when: _attempt | int < 3
+
+    - name: Retry Syslog fetch
+      ansible.builtin.include_tasks: fetch-syslog-logs.yml
+      vars:
+        _attempt: "{{ _attempt | int + 1 }}"
+      when: _attempt | int < 3
+
+    - name: Warn — Syslog log retrieval failed after 3 attempts
+      ansible.builtin.debug:
+        msg: "WARNING: Syslog log retrieval failed after 3 attempts. Continuing."
+      when: _attempt | int >= 3

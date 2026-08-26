@@ -1,0 +1,88 @@
+---
+# Fetch CloudWatch logs with up to 3 attempts.
+# Variables expected: cw_secret, file_path, aws_cw_region, cl_log_dir, clo_version
+- name: Fetch CloudWatch logs (attempt {{ _attempt }})
+  block:
+    - name: Install boto3
+      ansible.builtin.pip:
+        name: boto3
+
+    - name: Check if the secret "{{ cw_secret }}" exists in the openshift-logging namespace
+      ansible.builtin.shell: oc get secret "{{ cw_secret }}" -n openshift-logging
+      register: aws_secret
+      ignore_errors: true
+
+    - name: Get AWS access key ID from secret
+      ansible.builtin.shell: |
+        oc get secret "{{ cw_secret }}" -n openshift-logging -o jsonpath="{.data.aws_access_key_id}" | base64 --decode
+      register: aws_access_key
+      ignore_errors: true
+      when: aws_secret.failed == false
+
+    - name: Get AWS secret key from "{{ cw_secret }}"
+      ansible.builtin.shell: |
+        oc get secret "{{ cw_secret }}" -n openshift-logging -o jsonpath="{.data.aws_secret_access_key}" | base64 --decode
+      register: aws_secret_key
+      ignore_errors: true
+      when: aws_secret.failed == false
+
+    - name: Get log group prefix
+      ansible.builtin.shell: oc get Infrastructure/cluster -ojson | jq .status.infrastructureName
+      register: cw_log_gp
+      ignore_errors: true
+      when: aws_secret.failed == false
+
+    - name: Copy python script to fetch CloudWatch logs
+      ansible.builtin.copy:
+        src: "{{ role_path }}/files/get-cloudwatch-logs.py"
+        dest: "{{ file_path }}/get-cloudwatch-logs.py"
+      when: aws_secret.failed == false
+
+    - name: Get logs from AWS CloudWatch (CLO >= 6.0)
+      ansible.builtin.command: >
+        python3 get-cloudwatch-logs.py {{ aws_access_key.stdout }}
+        {{ aws_secret_key.stdout }} ocp-logtest {{ aws_cw_region }} {{ cl_log_dir }}
+      args:
+        chdir: "{{ file_path }}/"
+      async: 120
+      poll: 10
+      when:
+        - aws_secret.failed == false
+        - clo_version | float >= 6.0
+
+    - name: Get logs from AWS CloudWatch (CLO <= 5.9)
+      ansible.builtin.command: >
+        python3 get-cloudwatch-logs.py {{ aws_access_key.stdout }}
+        {{ aws_secret_key.stdout }} {{ cw_log_gp.stdout }} {{ aws_cw_region }} {{ cl_log_dir }}
+      args:
+        chdir: "{{ file_path }}/"
+      async: 120
+      poll: 10
+      when:
+        - aws_secret.failed == false
+        - clo_version | float <= 5.9
+
+    - name: Validate CloudWatch logs have content
+      ansible.builtin.shell: |
+        [ -s "{{ cl_log_dir }}/cloudwatch/application.txt" ] && \
+        [ -s "{{ cl_log_dir }}/cloudwatch/audit.txt" ] && \
+        [ -s "{{ cl_log_dir }}/cloudwatch/infrastructure.txt" ]
+      changed_when: false
+      register: cw_valid
+      when: aws_secret.failed == false
+  rescue:
+    - name: CloudWatch retry pause (attempt {{ _attempt }})
+      ansible.builtin.pause:
+        seconds: 60
+      when: _attempt | int < 3
+
+    - name: Retry CloudWatch fetch
+      ansible.builtin.include_tasks: fetch-cloudwatch-logs-retry.yml
+      vars:
+        _attempt: "{{ _attempt | int + 1 }}"
+      when: _attempt | int < 3
+
+    - name: Warn — CloudWatch log retrieval failed after 3 attempts
+      ansible.builtin.debug:
+        msg: "WARNING: CloudWatch log retrieval failed after 3 attempts. Continuing."
+      when: _attempt | int >= 3

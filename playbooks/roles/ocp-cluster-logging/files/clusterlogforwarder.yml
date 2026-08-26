@@ -15,28 +15,28 @@
     - audit
     - infra
   when: elasticsearch_server_url is defined
-  ignore_errors: yes
+  ignore_errors: true
 
 # Generating the ClusterLogForwarder custom resource yaml file with specified external third-party systems
 - name: Generating ClusterLogForwarder file
+  delegate_to: localhost
   template:
     src: "{{ role_path }}/templates/clf-instance.yml.j2"
     dest: "{{ role_path }}/files/clf-instance.yml"
-  delegate_to: localhost
   when: clo_version | float < 6.0
 
 - name: Generating ClusterLogForwarder file
+  delegate_to: localhost
   template:
     src: "{{ role_path }}/templates/new-clf-instance.yml.j2"
     dest: "{{ role_path }}/files/new-clf-instance.yml"
-  delegate_to: localhost
   when: clo_version | float >= 6.0
 
 # Creating ClusterLogForwarder custom resource
-- include_tasks: "{{ role_path }}/files/clf-instance.yml"
+- ansible.builtin.include_tasks: "{{ role_path }}/files/clf-instance.yml"
   when: clo_version | float < 6.0
 
-- include_tasks: "{{ role_path }}/files/new-clf-instance.yml"
+- ansible.builtin.include_tasks: "{{ role_path }}/files/new-clf-instance.yml"
   when: clo_version | float >= 6.0
 
 # Check if the pods are in good state
@@ -46,7 +46,7 @@
   until: pods.stdout|int == 0
   retries: 6
   delay: 60
-  ignore_errors: yes
+  ignore_errors: true
   
 - name: Get error state pods 
   shell: oc get pod -n openshift-logging | grep Error| wc -l
@@ -81,183 +81,144 @@
 
 - set_fact: 
     syslog_server_logfile: "/var/log/messages"
-    external_server_logs_path: "/root/clf_logs"
+    external_server_logs_path: "{{ cl_log_dir }}"
 
 - name: Pause for 2 minutes to get new logs
   pause:
     minutes: 2
 
-- name: Fetch the logs from external instances 
+- name: Fetch the logs from external instances
   block:
-    # Save the logs on external Kafka system and fetch on bastion
-    - block:
-      - name: Save the logs on Kafka server
-        shell: |
-          mkdir -p {{ external_server_logs_path }}/kafka
-          {{ kafka_path }}/kafka-console-consumer.sh --bootstrap-server {{ kafka_host }}:9092 --topic {{ app_log_label }} --max-messages 10 > {{ external_server_logs_path }}/kafka/application.txt
-          {{ kafka_path }}/kafka-console-consumer.sh --bootstrap-server {{ kafka_host }}:9092 --topic {{ audit_log_label }} --max-messages 10 > {{ external_server_logs_path }}/kafka/audit.txt
-          {{ kafka_path }}/kafka-console-consumer.sh --bootstrap-server {{ kafka_host }}:9092 --topic {{ infra_log_label }} --max-messages 10 > {{ external_server_logs_path }}/kafka/infrastructure.txt
-        async: 120
-        poll: 10
+    # ── Shared SSH key (used by both Kafka and Syslog blocks) ─────────────────
+    - name: Create temporary SSH private key
+      ansible.builtin.copy:
+        content: "{{ lookup('file', lookup('ansible.builtin.env', 'LOGGING_PRIVATE_KEY')) }}\n"
+        dest: "/tmp/logging_key"
+        mode: '0600'
+      delegate_to: localhost
+      run_once: true
+      no_log: true
+      when: kafka_server_url is defined or syslog_server_url is defined
 
-      - name: Copy the logs file from Kafka to bastion
-        fetch:
-          src: "{{ external_server_logs_path }}/kafka/{{ item }}.txt"
-          dest: "{{ cl_log_dir }}/kafka/{{ item }}.txt"
-          flat: yes
-        loop:
-        - "audit"
-        - "infrastructure" 
-        - "application"
-      delegate_to: kafka
+    # ── Kafka ─────────────────────────────────────────────────────────────────
+    - name: Fetch Kafka logs with retry
+      ansible.builtin.include_tasks: "{{ role_path }}/files/fetch-kafka-logs.yml"
+      vars:
+        _attempt: 1
       when: kafka_server_url is defined
 
-    #Make lokistack.sh file executable
+    # ── LokiStack ─────────────────────────────────────────────────────────────
+    - name: copy lokistack.sh file
+      ansible.builtin.copy:
+        src: "{{ role_path }}/files/lokistack.sh"
+        dest: "{{ file_path }}/lokistack.sh"
+
     - name: Give executable permissions for lokistack.sh file
-      file:
-        path: "{{ role_path }}/files/lokistack.sh"
+      ansible.builtin.file:
+        path: "{{ file_path }}/lokistack.sh"
         mode: '0555'
         state: file
 
-    # Check if lokistack exists
     - name: Check the Lokistack
-      shell: oc get lokistack -n openshift-logging | grep lokistack | awk 'NR==1{print $1}'
+      ansible.builtin.shell: oc get lokistack -n openshift-logging | grep lokistack | awk 'NR==1{print $1}'
       register: lokistack_present
 
-    # Save the logs on external lokistack and fetch on bastion
-    - name: Save the logs for lokistack instance
-      shell: |
-        echo "{{ lokistack_present.stdout }}"
-        mkdir -p {{ cl_log_dir }}/lokistack
-        {{ role_path }}/files/lokistack.sh {{ lokistack_present.stdout }}
-      when: lokistack_present.stdout|length > 0
+    - name: Fetch LokiStack logs with retry
+      ansible.builtin.include_tasks: "{{ role_path }}/files/fetch-lokistack-logs.yml"
+      vars:
+        _attempt: 1
+        lokistack_name: "{{ lokistack_present.stdout }}"
+      when: lokistack_present.stdout | length > 0
 
-    # Save the logs on external Syslog system and fecth on bastion
-    - block:
-      - name: Save the logs on external Syslog instance
-        shell: |
-          mkdir -p {{ external_server_logs_path }}/syslog
-          awk "NR >= 100" {{ syslog_server_logfile }} | grep {{ log_labels }}-audit | shuf -n 10 > {{ external_server_logs_path }}/syslog/audit.txt
-          awk "NR >= 100" {{ syslog_server_logfile }} | grep {{ log_labels }}-infrastructure | shuf -n 10 > {{ external_server_logs_path }}/syslog/infrastructure.txt
-          awk "NR >= 100" {{ syslog_server_logfile }} | grep {{ log_labels }}-application | shuf -n 10 > {{ external_server_logs_path }}/syslog/application.txt
-        async: 60
-        poll: 5
-        args:
-          executable: /bin/bash
-
-      - name: Copy the logs file from Syslog to bastion
-        fetch:
-          src: "{{ external_server_logs_path }}/syslog/{{ item }}.txt"
-          dest: "{{ cl_log_dir }}/syslog/{{ item }}.txt"
-          flat: yes
-        loop:
-        - "audit"
-        - "infrastructure" 
-        - "application"
-      delegate_to: syslog
+    # ── Syslog ────────────────────────────────────────────────────────────────
+    - name: Fetch Syslog logs with retry
+      ansible.builtin.include_tasks: "{{ role_path }}/files/fetch-syslog-logs.yml"
+      vars:
+        _attempt: 1
       when: syslog_server_url is defined
 
-    # Fetch logs from Elasticsearch
-    - name: Fetch Logs from Elasticsearch
-      shell: |
-        curl -XGET "{{ elasticsearch_server_url }}/infra*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.label":"{{ infra_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/infrastructure.txt
-        curl -XGET "{{ elasticsearch_server_url }}/audit*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.label":"{{ audit_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/audit.txt
-        curl -XGET "{{ elasticsearch_server_url }}/app*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.label":"{{ app_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/application.txt
-      when: 
-        - elasticsearch_server_url is defined
-        - clo_version | float >= 6.0
+    # ── Elasticsearch ─────────────────────────────────────────────────────────
+    - name: Fetch Elasticsearch logs with retry
+      ansible.builtin.include_tasks: "{{ role_path }}/files/fetch-elasticsearch-logs.yml"
+      vars:
+        _attempt: 1
+      when: elasticsearch_server_url is defined
 
-    - name: Fetch Logs from Elasticsearch
-      shell: |
-        curl -XGET "{{ elasticsearch_server_url }}/infra*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.logs":"{{ infra_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/infrastructure.txt
-        curl -XGET "{{ elasticsearch_server_url }}/audit*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.logs":"{{ audit_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/audit.txt
-        curl -XGET "{{ elasticsearch_server_url }}/app*/_search" -H 'Content-Type: application/json' -d '{ "query": { "bool": { "must": [ { "match":{"openshift.labels.logs":"{{ app_log_label }}"} } ] } } }' > {{ cl_log_dir }}/elasticsearch/application.txt
-      when:
-        - elasticsearch_server_url is defined
-        - clo_version | float <= 5.9
-
-    # Fetch logs from Loki
-    - name: Fetch logs from Loki
-      shell: |
-        curl -G -s "{{ loki_server_url }}/api/prom/query" --data-urlencode 'query={log_type="infrastructure"}' > {{ cl_log_dir }}/loki/infrastructure.txt
-        curl -G -s "{{ loki_server_url }}/api/prom/query" --data-urlencode 'query={log_type="audit"}' > {{ cl_log_dir }}/loki/audit.txt
-        curl -G -s "{{ loki_server_url }}/api/prom/query" --data-urlencode 'query={log_type="application"}' > {{ cl_log_dir }}/loki/application.txt
-      async: 120
-      poll: 10
+    # ── Loki ──────────────────────────────────────────────────────────────────
+    - name: Fetch Loki logs with retry
+      ansible.builtin.include_tasks: "{{ role_path }}/files/fetch-loki-logs.yml"
+      vars:
+        _attempt: 1
       when: loki_server_url is defined
 
-    # Deleting CLF Custom Resource instance because Fluentd and CloudWatch stores the logs on their system
-    - name: Delete ClusterLogForwarder
-      shell: oc delete ClusterLogForwarder instance -n openshift-logging
-      when: clo_version | float <= 5.9
+    # ── CloudWatch ────────────────────────────────────────────────────────────
+    - name: Fetch CloudWatch logs with retry
+      ansible.builtin.include_tasks: "{{ role_path }}/files/fetch-cloudwatch-logs-retry.yml"
+      vars:
+        _attempt: 1
+      when: cw_secret is defined
 
-    - name: Delete ClusterLogForwarder
-      shell: oc delete obsclf collector -n openshift-logging
-      when: clo_version | float >= 6.0
-
+    # ── Pod restart check ─────────────────────────────────────────────────────
     - name: Check the logging pods are restarting
-      shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 == "Terminating" ) print $1}' | wc -l
+      ansible.builtin.shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 == "Terminating" ) print $1}' | wc -l
       register: pods
       until: pods.stdout|int > 0
       retries: 20
       delay: 5
 
     - name: Delete pods if not restarted automatic
-      shell: oc delete pod $(oc get pods -n openshift-logging| grep 'fluent\|collector' | awk '{print $1}') -n openshift-logging
+      ansible.builtin.shell: oc delete pod $(oc get pods -n openshift-logging| grep 'fluent\|collector' | awk '{print $1}') -n openshift-logging
       when: pods.failed
 
-    # Check pods are in good state
     - name: Check the logging pods are in good state
-      shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 != "Running" && $3 != "Completed" ) print $1}' | wc -l
+      ansible.builtin.shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 != "Running" && $3 != "Completed" ) print $1}' | wc -l
       register: pods
       until: pods.stdout|int == 0
       retries: 10
       delay: 90
 
-    # Fetch logs from Fluentd and clean up
+    # ── Fluentd ───────────────────────────────────────────────────────────────
     - block:
       - name: Fetch container ID from Fluentd
-        shell: podman container list | awk '{if($3=="fluentd") print $1 }'
+        ansible.builtin.shell: podman container list | awk '{if($3=="fluentd") print $1 }'
         register: container_id
         async: 20
         poll: 5
 
       - name: Save the logs on external Fluentd instance
-        shell: |
+        ansible.builtin.shell: |
           mkdir -p {{ external_server_logs_path }}/fluentd
-          docker exec -it {{ container_id.stdout }} cat fluentd/log/data.log | grep {{ log_labels }}-audit | shuf -n 10 > {{ external_server_logs_path }}/fluentd/audit.txt
-          docker exec -it {{ container_id.stdout }} cat fluentd/log/data.log | grep {{ log_labels }}-infrastructure | shuf -n 10 > {{ external_server_logs_path }}/fluentd/infrastructure.txt
-          docker exec -it {{ container_id.stdout }} cat fluentd/log/data.log | grep {{ log_labels }}-application | shuf -n 10 > {{ external_server_logs_path }}/fluentd/application.txt
+          podman exec -it {{ container_id.stdout }} cat fluentd/log/data.log | grep {{ log_labels }}-audit | shuf -n 10 > {{ external_server_logs_path }}/fluentd/audit.txt
+          podman exec -it {{ container_id.stdout }} cat fluentd/log/data.log | grep {{ log_labels }}-infrastructure | shuf -n 10 > {{ external_server_logs_path }}/fluentd/infrastructure.txt
+          podman exec -it {{ container_id.stdout }} cat fluentd/log/data.log | grep {{ log_labels }}-application | shuf -n 10 > {{ external_server_logs_path }}/fluentd/application.txt
           sleep 10s
           podman exec {{ container_id.stdout }} rm -rf /fluentd/log/
         async: 60
         poll: 5
 
       - name: Copy the logs file from Fluentd to bastion
-        fetch:
+        ansible.builtin.fetch:
           src: "{{ external_server_logs_path }}/fluentd/{{ item }}.txt"
           dest: "{{ cl_log_dir }}/fluentd/{{ item }}.txt"
           flat: yes
         loop:
-        - "audit"
-        - "infrastructure" 
-        - "application"
+          - audit
+          - infrastructure
+          - application
       delegate_to: fluentd
       when: fluentd_server_url is defined
 
-    # Fetch logs from CloudWatch and cleans the logs at AWS CloudWatch
-    - name: Fetch logs from AWS CloudWatch 
-      include_tasks: "{{ role_path }}/files/get-cloudwatch-logs.yml"
-      when: cw_secret is defined
-
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     - name: Syslog clean up
-      shell: 'echo 0 > {{ syslog_server_logfile }}'
+      ansible.builtin.shell: 'echo 0 > {{ syslog_server_logfile }}'
       when: syslog_host is defined
       delegate_to: syslog
 
     - name: Kafka clean up
-      shell: |
-        {{ kafka_path }}/kafka-topics.sh --delete --topic {{ log_labels }}-.* --zookeeper localhost:2181
+      ansible.builtin.shell: |
+        {{ kafka_path }}/kafka-topics.sh --delete --bootstrap-server {{ kafka_host }}:{{ kafka_port }} --topic {{ app_log_label }}
+        {{ kafka_path }}/kafka-topics.sh --delete --bootstrap-server {{ kafka_host }}:{{ kafka_port }} --topic {{ audit_log_label }}
+        {{ kafka_path }}/kafka-topics.sh --delete --bootstrap-server {{ kafka_host }}:{{ kafka_port }} --topic {{ infra_log_label }}
         systemctl stop kafka
         systemctl stop zookeeper
         sleep 5s
@@ -269,21 +230,74 @@
       when: kafka_server_url is defined
       delegate_to: kafka
 
-    - name: Elasticsearch clean up
-      shell: |
+    - name: Elasticsearch clean up (CLO >= 6.0)
+      ansible.builtin.shell: |
         curl -X POST "{{ elasticsearch_server_url }}/audit*/_delete_by_query?pretty" -H 'Content-Type: application/json' -d '{ "query": { "match": { "openshift.labels.label":"{{ audit_log_label }}" } }}'
         curl -X POST "{{ elasticsearch_server_url }}/app*/_delete_by_query?pretty" -H 'Content-Type: application/json' -d '{ "query": { "match": { "openshift.labels.label":"{{ app_log_label }}" } }}'
         curl -X POST "{{ elasticsearch_server_url }}/infra*/_delete_by_query?pretty" -H 'Content-Type: application/json' -d '{ "query": { "match": { "openshift.labels.label":"{{ infra_log_label }}" } }}'
-      when: 
+      when:
         - elasticsearch_server_url is defined
         - clo_version | float >= 6.0
 
-    - name: Elasticsearch clean up
-      shell: |
+    - name: Elasticsearch clean up (CLO <= 5.9)
+      ansible.builtin.shell: |
         curl -X POST "{{ elasticsearch_server_url }}/audit*/_delete_by_query?pretty" -H 'Content-Type: application/json' -d '{ "query": { "match": { "openshift.labels.logs":"{{ audit_log_label }}" } }}'
         curl -X POST "{{ elasticsearch_server_url }}/app*/_delete_by_query?pretty" -H 'Content-Type: application/json' -d '{ "query": { "match": { "openshift.labels.logs":"{{ app_log_label }}" } }}'
         curl -X POST "{{ elasticsearch_server_url }}/infra*/_delete_by_query?pretty" -H 'Content-Type: application/json' -d '{ "query": { "match": { "openshift.labels.logs":"{{ infra_log_label }}" } }}'
       when:
         - elasticsearch_server_url is defined
         - clo_version | float <= 5.9
-  ignore_errors: yes
+
+    # ── SSH key cleanup ───────────────────────────────────────────────────────
+    - name: Remove temporary SSH private key
+      ansible.builtin.file:
+        path: "/tmp/logging_key"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      when: kafka_server_url is defined or syslog_server_url is defined
+  ignore_errors: true
+
+# Deleting CLF Custom Resource instance because Fluentd and CloudWatch stores the logs on their system
+- name: CLF cleanup
+  block:
+    - name: Delete ClusterLogForwarder
+      ansible.builtin.shell: oc delete ClusterLogForwarder collector -n openshift-logging
+      when: clo_version | float <= 5.9
+
+    - name: Delete ClusterLogForwarder
+      ansible.builtin.shell: oc delete obsclf collector -n openshift-logging
+      when: clo_version | float >= 6.0
+
+    - name: Check the logging pods are restarting
+      ansible.builtin.shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 == "Terminating" ) print $1}' | wc -l
+      register: pods
+      until: pods.stdout|int > 0
+      retries: 20
+      delay: 5
+
+    - name: Delete pods if not restarted automatic
+      ansible.builtin.shell: oc delete pod $(oc get pods -n openshift-logging| grep 'fluent\|collector' | awk '{print $1}') -n openshift-logging
+      when: pods.failed
+
+    # Check pods are in good state
+    - name: Check the logging pods are in good state
+      ansible.builtin.shell: oc get pods -n openshift-logging --no-headers | awk '{if ($3 != "Running" && $3 != "Completed" ) print $1}' | wc -l
+      register: pods
+      until: pods.stdout|int == 0
+      retries: 10
+      delay: 90
+  when: not enable_logging_uiplugin
+  ignore_errors: true
+
+- name: Create archive on target machine
+  ansible.builtin.archive:
+    path: "{{ cl_log_dir }}"
+    dest: /tmp/clf_logs.tar.gz
+    format: gz
+
+- name: Fetch archive to Ansible controller
+  ansible.builtin.fetch:
+    src: /tmp/clf_logs.tar.gz
+    dest: "{{ playbook_dir }}/../../deploy/"
+    flat: true
